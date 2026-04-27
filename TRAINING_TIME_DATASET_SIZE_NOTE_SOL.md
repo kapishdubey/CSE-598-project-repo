@@ -163,3 +163,156 @@ Metrics reported:
 
 With those four, you can predict total wall time far better than “GB”.
 
+---
+
+## 6) Full Option‑A evaluation script (baseline + improved)
+
+This is the exact script used for our Option‑A evaluation on the 3 held‑out towns
+(Town03/Town05/Town07). It:
+
+- loads one checkpoint,
+- evaluates it on each case directory under `/scratch/$USER/transfuser/eval_cases/case_<TownXX>/`,
+- prints per-town `loss_total`,
+- prints across-town mean/std/stderr for key losses,
+- writes a JSON with per-case metrics + summary.
+
+### 6.1 Baseline script (RegNetY 032; CKPT = `model_10.pth`)
+
+Run on a GPU node (recommended). It automatically selects `BATCH_SIZE=12` on
+A100-80GB and `BATCH_SIZE=6` otherwise.
+
+```bash
+python - <<'PY'
+import os, math, json, statistics
+import torch
+
+REPO_TC = "/scratch/kdubey3/transfuser/repo/team_code_transfuser"
+CKPT = "/scratch/kdubey3/transfuser/log/run_51857823/transfuser_sol/model_10.pth"
+CASES_ROOT = "/scratch/kdubey3/transfuser/eval_cases"
+CASES = ["Town03", "Town05", "Town07"]
+NUM_WORKERS = 8
+
+import sys
+sys.path.insert(0, REPO_TC)
+from config import GlobalConfig
+from model import LidarCenterNet
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+if device == "cuda":
+    props = torch.cuda.get_device_properties(0)
+    vram_gb = props.total_memory / (1024**3)
+else:
+    vram_gb = 0.0
+
+BATCH_SIZE = 12 if vram_gb >= 70 else 6
+print("Device:", device, "VRAM_GB:", round(vram_gb, 1), "BATCH_SIZE:", BATCH_SIZE)
+
+def load_model(cfg):
+    net = LidarCenterNet(
+        cfg, device, backbone=cfg.backbone,
+        image_architecture="regnety_032",
+        lidar_architecture="regnety_032",
+        use_velocity=False,
+    )
+    sd = torch.load(CKPT, map_location=device)
+    if any(k.startswith("module.") for k in sd.keys()):
+        sd = {k[len("module."):]: v for k, v in sd.items()}
+    net.load_state_dict(sd, strict=False)
+    net.eval()
+    return net
+
+def build_weights(cfg):
+    return {k: float(cfg.detailed_losses_weights[i]) for i, k in enumerate(cfg.detailed_losses)}
+
+@torch.no_grad()
+def eval_case(case_name):
+    root_dir = os.path.join(CASES_ROOT, f"case_{case_name}")
+    cfg = GlobalConfig(root_dir=root_dir, setting="all")
+    cfg.backbone = "transFuser"
+    cfg.use_target_point_image = True
+    cfg.use_point_pillars = False
+    cfg.augment = False  # deterministic eval
+
+    from data import CARLA_Data
+    ds = CARLA_Data(root=cfg.train_data, config=cfg, shared_dict=None)
+    dl = torch.utils.data.DataLoader(
+        ds, batch_size=BATCH_SIZE, shuffle=False,
+        num_workers=NUM_WORKERS, pin_memory=True,
+        persistent_workers=True
+    )
+
+    net = load_model(cfg)
+    w = build_weights(cfg)
+
+    sums = {k: 0.0 for k in cfg.detailed_losses}
+    total_sum = 0.0
+    n_batches = 0
+
+    for batch in dl:
+        losses = net(
+            batch["rgb"].to(device, dtype=torch.float32),
+            batch["lidar"].to(device, dtype=torch.float32),
+            ego_waypoint=batch["ego_waypoint"].to(device, dtype=torch.float32),
+            target_point=batch["target_point"].to(device, dtype=torch.float32),
+            target_point_image=batch["target_point_image"].to(device, dtype=torch.float32),
+            ego_vel=batch["speed"].to(device, dtype=torch.float32).reshape(-1, 1),
+            bev=batch["bev"].to(device, dtype=torch.long),
+            label=batch["label"].to(device, dtype=torch.float32),
+            depth=batch["depth"].to(device, dtype=torch.float32),
+            semantic=batch["semantic"].squeeze(1).to(device, dtype=torch.long),
+            num_points=batch.get("num_points", None),
+        )
+
+        total = 0.0
+        for k, v in losses.items():
+            if k not in sums:
+                continue
+            val = float((w.get(k, 0.0) * v).mean().item())
+            sums[k] += val
+            total += val
+        total_sum += total
+        n_batches += 1
+
+    out = {k: sums[k] / n_batches for k in sums}
+    out["loss_total"] = total_sum / n_batches
+    out["batches"] = n_batches
+    out["case"] = case_name
+    return out
+
+results = []
+for c in CASES:
+    r = eval_case(c)
+    print(f"Case {c}: batches={r['batches']} loss_total={r['loss_total']:.6f}")
+    results.append(r)
+
+keys = [k for k in results[0].keys() if k.startswith("loss_")]
+summary = {}
+print("\n=== Across-case summary (mean, std, stderr) over 3 test cases ===")
+for k in sorted(keys):
+    vals = [r[k] for r in results]
+    mean = statistics.mean(vals)
+    std = statistics.pstdev(vals) if len(vals) > 1 else 0.0
+    stderr = std / math.sqrt(len(vals)) if len(vals) > 0 else 0.0
+    summary[k] = {"mean": mean, "std": std, "stderr": stderr}
+    if k in ("loss_total", "loss_wp", "loss_bev", "loss_depth", "loss_semantic"):
+        print(f"{k:>12}: mean={mean:.6f} std={std:.6f} stderr={stderr:.6f}")
+
+out_path = os.path.join(CASES_ROOT, "baseline_eval_town03_05_07.json")
+with open(out_path, "w") as f:
+    json.dump({"per_case": results, "summary": summary}, f, indent=2)
+print("\nWrote:", out_path)
+PY
+```
+
+### 6.2 Improved script changes (EffNetV2‑S)
+
+For the improved model, keep the script identical except:
+
+1. Change the checkpoint:
+   - `CKPT = "/scratch/kdubey3/transfuser/log/improved_run_<JOBID>/improved/model_<E>.pth"`
+2. Change the model architectures in `load_model()`:
+   - `image_architecture="tf_efficientnetv2_s_in21ft1k"`
+   - `lidar_architecture="tf_efficientnetv2_s_in21ft1k"`
+3. Change the output JSON name:
+   - `improved_eval_town03_05_07.json` (or add `_epoch2` if evaluating `model_2.pth`)
+
